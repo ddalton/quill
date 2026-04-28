@@ -1,0 +1,55 @@
+# Example Quill config. Copy to quill.toml and edit.
+
+[http]
+# Bind on localhost only by default; non-localhost bindings require [http.tls].
+address = "127.0.0.1:5000"
+
+# Optional: explicit TLS. If omitted on a localhost binding, Quill auto-generates
+# a self-signed cert under <storage.root>/_quill/.
+# [http.tls]
+# cert = "/etc/quill/tls/server.crt"
+# key  = "/etc/quill/tls/server.key"
+
+# Optional: htpasswd-based basic auth. Same format as zot — bcrypt hashes one
+# user per line. Generate with: htpasswd -B -c quill.htpasswd alice
+# [http.auth.htpasswd]
+# path = "/etc/quill/htpasswd"
+
+[storage]
+# CAS root. Same on-disk layout as zot — drop in an existing zot rootDir if you
+# want to reuse cached blobs.
+root = "/var/lib/quill"
+blob_meta_ttl_secs = 60
+
+# Upstream registries — repo prefix routing. Pulls of /v2/<prefix>/... go through
+# the matching upstream. Phase 3 wires up actual fetching; Phase 1 parses these
+# but only serves from local CAS.
+#
+# --- ECR ---
+# ECR uses HTTP basic auth: username is the literal string "AWS", password is
+# the 12-hour token from `aws ecr get-login-password --region <region>`. Refresh
+# the password every ~12 hours (cron, ssh wrapper, or a tiny shell script that
+# regenerates this file and HUPs quill).
+#
+# [[upstream]]
+# name = "ecr-prod"
+# url = "https://123456789.dkr.ecr.us-east-1.amazonaws.com"
+# kind = "ecr"
+# repo_prefix = "myteam/"
+#
+# [upstream.auth]
+# type = "basic"
+# username = "AWS"
+# password = "eyJwYXlsb2FkIjoi..."  # output of `aws ecr get-login-password`
+
+# --- Harbor ---
+# [[upstream]]
+# name = "harbor"
+# url = "https://harbor.internal.example.com"
+# kind = "harbor"
+# repo_prefix = "harbor/"
+#
+# [upstream.auth]
+# type = "basic"
+# username = "ci"
+# password = "redacted"
