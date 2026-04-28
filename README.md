@@ -10,13 +10,22 @@ in the sibling zot repo for the full design.
 
 ## Status
 
-**Phases 1 + 3 complete.** Local CAS server with TLS, htpasswd auth, and
-streaming pull-through cache against any standard OCI registry (anonymous +
-bearer + HTTP basic). Verified end-to-end against Docker Hub; cold pulls
-stream-while-cache, warm pulls serve from local CAS in ~3 ms.
+**Phases 1, 2, 3 complete.** Local CAS server with TLS, htpasswd auth,
+streaming pull-through cache against any standard OCI registry (anonymous,
+bearer, HTTP basic), and a full push path with locally-pushed-tag precedence
+(`_local_tags.json`).
 
-Phase 2 (push path) and Phase 4 (GC + tag-revalidation TTL) are next. See
-[docs/PROGRESS.md](docs/PROGRESS.md) for detailed status.
+Verified end-to-end:
+- Cold pull from Docker Hub: stream-while-cache, ~390 ms.
+- Warm pull: ~3 ms (local CAS, zero upstream traffic).
+- Push: full init → patch → put → manifest-put round-trip; pull-back is
+  byte-identical.
+- Local-tag precedence: a tag pushed to `library/redis:7-patched` is served
+  locally with zero upstream contact, while `library/redis:7-alpine` falls
+  through to Docker Hub as expected.
+
+Phase 4 (mark-and-sweep GC + tag-revalidation TTL + tags/list merge) is
+optional polish. See [docs/PROGRESS.md](docs/PROGRESS.md) for detailed status.
 
 ## Build and run
 
@@ -30,16 +39,18 @@ By default, quill binds `127.0.0.1:5000` and auto-generates a self-signed cert
 under `<storage.root>/_quill/` on first run. Non-localhost binds require an
 explicit `[http.tls]` config block.
 
-## Smoke test
+## Smoke tests
 
-After `cargo build`, run the pull-through smoke script:
+After `cargo build`, run either smoke script:
 
 ```sh
-./scripts/smoke-pullthrough.sh
+./scripts/smoke-pullthrough.sh   # Phase 3: cold + warm pull through Docker Hub
+./scripts/smoke-push.sh          # Phase 2: full push round-trip + pull-back
 ```
 
-Expected: cold pull from Docker Hub takes ~30–400 ms (network bound),
-subsequent warm pulls take ~3 ms (local CAS hit, zero upstream traffic).
+Expected: cold pull ~30–400 ms (network), warm pull ~3 ms (local CAS, zero
+upstream traffic). Push smoke verifies byte-identical round-trip and
+`_local_tags.json` correctness.
 
 ## Workspace layout
 

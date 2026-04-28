@@ -17,7 +17,7 @@ use quill_auth::{AuthLayer, AuthState, HtpasswdStore};
 use quill_config::Config;
 use quill_pullthrough::PullThroughTable;
 use quill_registry::{router as registry_router, RegistryState, UpstreamTagCache};
-use quill_storage::{CasLayout, LocalStorage, LocalTagsStore};
+use quill_storage::{CasLayout, LocalStorage, LocalTagsStore, UploadStore};
 use quill_tls::{install_default_crypto_provider, server_config_from_files, server_config_self_signed};
 use quill_upstream::UpstreamRouter;
 
@@ -70,6 +70,12 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     ));
     let local_tags = Arc::new(LocalTagsStore::new(layout.clone()));
     load_existing_local_tags(&local_tags, &cfg.storage.root)?;
+    let uploads = Arc::new(UploadStore::new(layout.clone()));
+    if let Ok(removed) = uploads.sweep(Duration::from_secs(86_400)).await {
+        if removed > 0 {
+            info!(removed, "swept stale upload tempfiles older than 24h");
+        }
+    }
 
     // --- pull-through machinery + upstreams ---
     let pullthrough = Arc::new(PullThroughTable::new());
@@ -109,6 +115,7 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     let state = RegistryState::new(
         storage,
         local_tags,
+        uploads,
         pullthrough,
         upstreams,
         upstream_tag_cache,

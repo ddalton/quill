@@ -4,7 +4,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 
 use quill_pullthrough::PullThroughTable;
-use quill_storage::{Digest, LocalStorage, LocalTagsStore};
+use quill_storage::{Digest, LocalStorage, LocalTagsStore, UploadStore};
 use quill_upstream::UpstreamRouter;
 
 /// In-memory cache of upstream-resolved tags. (repo, tag) -> (digest, fetched_at).
@@ -47,6 +47,7 @@ impl UpstreamTagCache {
 pub struct RegistryState {
     pub storage: Arc<LocalStorage>,
     pub local_tags: Arc<LocalTagsStore>,
+    pub uploads: Arc<UploadStore>,
     pub pullthrough: Arc<PullThroughTable>,
     pub upstreams: Arc<UpstreamRouter>,
     pub upstream_tag_cache: Arc<UpstreamTagCache>,
@@ -56,6 +57,7 @@ impl RegistryState {
     pub fn new(
         storage: Arc<LocalStorage>,
         local_tags: Arc<LocalTagsStore>,
+        uploads: Arc<UploadStore>,
         pullthrough: Arc<PullThroughTable>,
         upstreams: Arc<UpstreamRouter>,
         upstream_tag_cache: Arc<UpstreamTagCache>,
@@ -63,6 +65,7 @@ impl RegistryState {
         Self {
             storage,
             local_tags,
+            uploads,
             pullthrough,
             upstreams,
             upstream_tag_cache,

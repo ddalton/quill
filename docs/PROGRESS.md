@@ -2,7 +2,7 @@
 
 This file tracks where we are in the plan defined in `PLAN.md` so implementation can restart cleanly across sessions or machines.
 
-**Last updated:** 2026-04-28 (Phase 3 streaming pull-through working end-to-end against Docker Hub)
+**Last updated:** 2026-04-28 (Phase 2 push path working; locally-pushed-tag precedence verified end-to-end against Docker Hub upstream)
 
 ---
 
@@ -11,7 +11,7 @@ This file tracks where we are in the plan defined in `PLAN.md` so implementation
 | Phase | Goal | Status |
 |---|---|---|
 | 1 | Local CAS server with TLS + auth | ✅ **Complete** |
-| 2 | Push path with `_local_tags.json` | ⬜ **Not started** |
+| 2 | Push path with `_local_tags.json` | ✅ **Complete** |
 | 3 | Streaming pull-through cache + upstream | ✅ **Complete** |
 | 4 | Polish + GC | ⬜ **Not started** |
 
@@ -51,9 +51,30 @@ curl -sk    https://127.0.0.1:5443/v2/myorg/team/img/tags/list                 #
 
 ---
 
-## Phase 2 — Push path + `_local_tags.json` — NOT STARTED
+## Phase 2 — Push path + `_local_tags.json` — DONE
 
-What needs to happen (PLAN.md §6 Phase 2 + §5.6).
+Verified end-to-end on 2026-04-28 with `scripts/smoke-push.sh`:
+- Init → patch → put → manifest-put round-trip (all 201).
+- Pull-back of manifest by tag and layer by digest are byte-identical to pushed payloads.
+- `_local_tags.json` written atomically with timestamp.
+- Locally-pushed tag (`library/redis:7-patched`) returns local manifest with **0 upstream contacts** even with `library/` configured as a Docker Hub upstream — proves PLAN.md §5.6 precedence.
+- Non-local tag (`library/redis:7-alpine`) in the same repo correctly falls through to upstream.
+
+What's in place:
+
+- **`quill-storage::uploads`**: `UploadStore` with `create_session` / `append` / `finalize` / `abort` / `sweep`. Sessions live at `<root>/<repo>/_uploads/<id>.data` + `.meta.json` sidecar. sha256 hasher state is in-memory only (restart abandons in-flight; document this).
+- **`quill-registry::routes`**: `dispatch` extended to recognize `POST /v2/<repo>/blobs/uploads/`, `PATCH|PUT /v2/<repo>/blobs/uploads/<session>`, `PUT /v2/<repo>/manifests/<ref>`, `DELETE /v2/<repo>/blobs/<digest>`, `DELETE /v2/<repo>/manifests/<ref>`. Push paths are matched before pull paths in `split()` because they're more specific (the `blobs/uploads/...` would otherwise be parsed as a digest).
+- **Manifest PUT by tag** atomically updates `_local_tags.json` via `LocalTagsStore::set`.
+- **Per-session mutex inside `UploadStore`** serializes PATCHes within a single session; reads stay lock-free.
+- **Startup sweep** of `_uploads/` files older than 24h via `UploadStore::sweep`.
+- **15 unit tests** passing across crates (added 2 in `quill-storage::uploads`).
+
+### Known limitations / Phase 4 polish targets
+
+- `put_manifest` does *not* yet validate that referenced blobs exist locally. A pushed manifest pointing at missing blobs would succeed but later pulls of those blobs would 404. Easy to add: `manifest.layers + manifest.config` blob existence check before persist.
+- Tag-list does not yet merge cached upstream tags (Phase 4 polish).
+- Resumable upload sha256 state across restart not implemented (in-memory only).
+- No bearer-token endpoint server-side (`/v2/token`); clients use Basic auth via `[http.auth.htpasswd]`.
 
 ### Order of work (intended)
 

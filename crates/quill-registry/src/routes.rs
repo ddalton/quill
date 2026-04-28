@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::Router;
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use tokio_util::io::ReaderStream;
 use tracing::{debug, instrument, warn};
 
@@ -39,10 +41,28 @@ enum Action<'a> {
     Blob(&'a str),
     Manifest(&'a str),
     TagsList,
+    /// `POST /v2/<repo>/blobs/uploads/` — open a new upload session.
+    UploadInit,
+    /// `PATCH|PUT /v2/<repo>/blobs/uploads/<session>` — append or finalize.
+    UploadSession(&'a str),
     Unknown,
 }
 
 fn split(rest: &str) -> Option<(&str, Action<'_>)> {
+    // Push paths must be matched before pull paths because they're more specific
+    // (`/blobs/uploads/...` would otherwise be parsed as a blob digest).
+    if let Some(repo) = rest.strip_suffix("/blobs/uploads/") {
+        return Some((repo, Action::UploadInit));
+    }
+    if let Some(repo) = rest.strip_suffix("/blobs/uploads") {
+        // Some clients omit the trailing slash on POST.
+        return Some((repo, Action::UploadInit));
+    }
+    if let Some((repo, session)) = rest.rsplit_once("/blobs/uploads/") {
+        if !session.is_empty() && !session.contains('/') {
+            return Some((repo, Action::UploadSession(session)));
+        }
+    }
     if let Some((repo, digest)) = rest.rsplit_once("/blobs/") {
         if !digest.is_empty() && !digest.contains('/') {
             return Some((repo, Action::Blob(digest)));
@@ -59,11 +79,14 @@ fn split(rest: &str) -> Option<(&str, Action<'_>)> {
     Some(("", Action::Unknown))
 }
 
-#[instrument(skip(state), fields(method = %method, rest = %rest))]
+#[instrument(skip(state, query, body), fields(method = %method, rest = %rest))]
 async fn dispatch(
     State(state): State<Arc<RegistryState>>,
     method: Method,
     Path(rest): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Body,
 ) -> Response {
     let (repo, action) = match split(&rest) {
         Some(p) => p,
@@ -72,16 +95,29 @@ async fn dispatch(
     if repo.is_empty() {
         return RegistryError::name_unknown(rest).into_response();
     }
+    let repo_owned = repo.to_string();
     match (method, action) {
-        (Method::GET, Action::Blob(d)) => get_blob(&state, repo, d, true).await,
-        (Method::HEAD, Action::Blob(d)) => get_blob(&state, repo, d, false).await,
-        (Method::GET, Action::Manifest(r)) => get_manifest(&state, repo, r, true).await,
-        (Method::HEAD, Action::Manifest(r)) => get_manifest(&state, repo, r, false).await,
-        (Method::GET, Action::TagsList) => list_tags(&state, repo).await,
+        (Method::GET, Action::Blob(d)) => get_blob(&state, &repo_owned, d, true).await,
+        (Method::HEAD, Action::Blob(d)) => get_blob(&state, &repo_owned, d, false).await,
+        (Method::DELETE, Action::Blob(d)) => delete_blob(&state, &repo_owned, d).await,
+        (Method::GET, Action::Manifest(r)) => get_manifest(&state, &repo_owned, r, true).await,
+        (Method::HEAD, Action::Manifest(r)) => get_manifest(&state, &repo_owned, r, false).await,
+        (Method::PUT, Action::Manifest(r)) => {
+            put_manifest(&state, &repo_owned, r, &headers, body).await
+        }
+        (Method::DELETE, Action::Manifest(r)) => delete_manifest(&state, &repo_owned, r).await,
+        (Method::GET, Action::TagsList) => list_tags(&state, &repo_owned).await,
+        (Method::POST, Action::UploadInit) => upload_init(&state, &repo_owned).await,
+        (Method::PATCH, Action::UploadSession(s)) => {
+            upload_patch(&state, &repo_owned, s, body).await
+        }
+        (Method::PUT, Action::UploadSession(s)) => {
+            upload_put(&state, &repo_owned, s, &query, body).await
+        }
         _ => RegistryError::new(
             StatusCode::METHOD_NOT_ALLOWED,
             crate::RegistryErrorCode::Unsupported,
-            "method or endpoint not implemented in this phase",
+            "method or endpoint not implemented",
         )
         .into_response(),
     }
@@ -434,7 +470,257 @@ async fn list_tags(state: &RegistryState, repo: &str) -> Response {
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
+// ---------- push: blob uploads ----------
+
+async fn upload_init(state: &RegistryState, repo: &str) -> Response {
+    if let Err(e) = state.storage.ensure_repo(repo).await {
+        return internal_err(e);
+    }
+    let session = match state.uploads.create_session(repo).await {
+        Ok(s) => s,
+        Err(e) => return internal_err(e),
+    };
+    let location = format!("/v2/{repo}/blobs/uploads/{session}");
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(header::LOCATION, location)
+        .header(header::RANGE, "0-0")
+        .header("Docker-Upload-UUID", session.clone())
+        .body(Body::empty())
+        .expect("static")
+}
+
+async fn upload_patch(state: &RegistryState, repo: &str, session: &str, body: Body) -> Response {
+    let bytes = match collect_body(body, 5 * 1024 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let total = match state.uploads.append(repo, session, &bytes).await {
+        Ok(n) => n,
+        Err(quill_storage::UploadError::NotFound(_)) => {
+            return RegistryError::new(
+                StatusCode::NOT_FOUND,
+                crate::RegistryErrorCode::BlobUploadUnknown,
+                "upload session not found",
+            )
+            .into_response();
+        }
+        Err(e) => return internal_err(e),
+    };
+    let range = if total == 0 {
+        "0-0".to_string()
+    } else {
+        format!("0-{}", total - 1)
+    };
+    Response::builder()
+        .status(StatusCode::ACCEPTED)
+        .header(
+            header::LOCATION,
+            format!("/v2/{repo}/blobs/uploads/{session}"),
+        )
+        .header(header::RANGE, range)
+        .header("Docker-Upload-UUID", session.to_string())
+        .body(Body::empty())
+        .expect("static")
+}
+
+async fn upload_put(
+    state: &RegistryState,
+    repo: &str,
+    session: &str,
+    query: &HashMap<String, String>,
+    body: Body,
+) -> Response {
+    let digest_str = match query.get("digest") {
+        Some(d) => d.as_str(),
+        None => {
+            return RegistryError::new(
+                StatusCode::BAD_REQUEST,
+                crate::RegistryErrorCode::DigestInvalid,
+                "missing ?digest= query parameter",
+            )
+            .into_response();
+        }
+    };
+    let digest = match Digest::parse(digest_str) {
+        Ok(d) => d,
+        Err(_) => return RegistryError::digest_invalid(digest_str).into_response(),
+    };
+    let bytes = match collect_body(body, 5 * 1024 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    match state
+        .uploads
+        .finalize(
+            repo,
+            session,
+            if bytes.is_empty() { None } else { Some(&bytes) },
+            &digest,
+        )
+        .await
+    {
+        Ok((_path, _total)) => Response::builder()
+            .status(StatusCode::CREATED)
+            .header(header::LOCATION, format!("/v2/{repo}/blobs/{digest}"))
+            .header("Docker-Content-Digest", digest.to_string())
+            .body(Body::empty())
+            .expect("static"),
+        Err(quill_storage::UploadError::DigestMismatch { expected, got }) => RegistryError::new(
+            StatusCode::BAD_REQUEST,
+            crate::RegistryErrorCode::DigestInvalid,
+            format!("digest mismatch: expected {expected}, got {got}"),
+        )
+        .into_response(),
+        Err(quill_storage::UploadError::NotFound(_)) => RegistryError::new(
+            StatusCode::NOT_FOUND,
+            crate::RegistryErrorCode::BlobUploadUnknown,
+            "upload session not found",
+        )
+        .into_response(),
+        Err(e) => internal_err(e),
+    }
+}
+
+// ---------- push: manifests + deletes ----------
+
+async fn put_manifest(
+    state: &RegistryState,
+    repo: &str,
+    reference: &str,
+    headers: &HeaderMap,
+    body: Body,
+) -> Response {
+    if let Err(e) = state.storage.ensure_repo(repo).await {
+        return internal_err(e);
+    }
+    let bytes = match collect_body(body, 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    // Compute digest of the bytes.
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let hex = hex::encode(h.finalize());
+    let digest = match Digest::parse(&format!("sha256:{hex}")) {
+        Ok(d) => d,
+        Err(e) => return internal_err(e),
+    };
+
+    // If the reference is a digest, it must match the body's hash.
+    if let Ok(ref_digest) = Digest::parse(reference) {
+        if ref_digest != digest {
+            return RegistryError::new(
+                StatusCode::BAD_REQUEST,
+                crate::RegistryErrorCode::ManifestInvalid,
+                format!("manifest body digest {digest} does not match reference {ref_digest}"),
+            )
+            .into_response();
+        }
+    }
+
+    // Persist manifest by digest.
+    if let Err(e) = state.storage.put_blob_buffered(repo, &digest, bytes).await {
+        return internal_err(e);
+    }
+
+    // If the reference is a tag (not a digest), record it as locally pushed.
+    if Digest::parse(reference).is_err() {
+        if let Err(e) = state.local_tags.set(repo, reference, &digest) {
+            warn!(error = %e, "failed to persist local tag");
+            return internal_err(e);
+        }
+    }
+
+    let mut builder = Response::builder()
+        .status(StatusCode::CREATED)
+        .header(
+            header::LOCATION,
+            format!("/v2/{repo}/manifests/{}", digest),
+        )
+        .header("Docker-Content-Digest", digest.to_string());
+    // Echo the client's content-type if they provided one.
+    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+        if let Ok(ct_str) = ct.to_str() {
+            builder = builder.header(header::CONTENT_TYPE, ct_str);
+        }
+    }
+    builder.body(Body::empty()).expect("static")
+}
+
+async fn delete_blob(state: &RegistryState, repo: &str, digest: &str) -> Response {
+    let parsed = match Digest::parse(digest) {
+        Ok(d) => d,
+        Err(_) => return RegistryError::digest_invalid(digest).into_response(),
+    };
+    match state.storage.delete_blob(repo, &parsed).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(quill_storage::StorageError::NotFound(_)) => {
+            RegistryError::blob_unknown(digest).into_response()
+        }
+        Err(e) => internal_err(e),
+    }
+}
+
+async fn delete_manifest(state: &RegistryState, repo: &str, reference: &str) -> Response {
+    // If reference is a tag, remove only the tag mapping; the manifest blob may
+    // still be referenced by a digest-addressed pull. Phase 4 GC will reclaim
+    // unreferenced manifest blobs.
+    if Digest::parse(reference).is_err() {
+        match state.local_tags.remove(repo, reference) {
+            Ok(true) => return StatusCode::ACCEPTED.into_response(),
+            Ok(false) => return RegistryError::manifest_unknown(reference).into_response(),
+            Err(e) => return internal_err(e),
+        }
+    }
+    // Digest-addressed: remove the manifest blob plus any local tag entries
+    // pointing at it.
+    let digest = Digest::parse(reference).unwrap();
+    let to_remove: Vec<String> = state
+        .local_tags
+        .list_for_repo(repo)
+        .into_iter()
+        .filter(|(_, m)| m.digest == digest.to_string())
+        .map(|(t, _)| t)
+        .collect();
+    for t in &to_remove {
+        let _ = state.local_tags.remove(repo, t);
+    }
+    match state.storage.delete_blob(repo, &digest).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(quill_storage::StorageError::NotFound(_)) => {
+            RegistryError::manifest_unknown(reference).into_response()
+        }
+        Err(e) => internal_err(e),
+    }
+}
+
 // ---------- helpers ----------
+
+async fn collect_body(body: Body, max_bytes: u64) -> Result<Bytes, Response> {
+    match body.collect().await {
+        Ok(c) => {
+            let bytes = c.to_bytes();
+            if bytes.len() as u64 > max_bytes {
+                return Err(RegistryError::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    crate::RegistryErrorCode::SizeInvalid,
+                    "request body too large",
+                )
+                .into_response());
+            }
+            Ok(bytes)
+        }
+        Err(e) => Err(RegistryError::new(
+            StatusCode::BAD_REQUEST,
+            crate::RegistryErrorCode::Unknown,
+            format!("body read failed: {e}"),
+        )
+        .into_response()),
+    }
+}
 
 fn internal_err(e: impl std::fmt::Display) -> Response {
     RegistryError::new(
