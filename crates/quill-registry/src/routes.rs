@@ -100,8 +100,14 @@ async fn dispatch(
         (Method::GET, Action::Blob(d)) => get_blob(&state, &repo_owned, d, true).await,
         (Method::HEAD, Action::Blob(d)) => get_blob(&state, &repo_owned, d, false).await,
         (Method::DELETE, Action::Blob(d)) => delete_blob(&state, &repo_owned, d).await,
-        (Method::GET, Action::Manifest(r)) => get_manifest(&state, &repo_owned, r, true).await,
-        (Method::HEAD, Action::Manifest(r)) => get_manifest(&state, &repo_owned, r, false).await,
+        (Method::GET, Action::Manifest(r)) => {
+            let resp = get_manifest(&state, &repo_owned, r, true).await;
+            apply_if_none_match(&headers, resp)
+        }
+        (Method::HEAD, Action::Manifest(r)) => {
+            let resp = get_manifest(&state, &repo_owned, r, false).await;
+            apply_if_none_match(&headers, resp)
+        }
         (Method::PUT, Action::Manifest(r)) => {
             put_manifest(&state, &repo_owned, r, &headers, body).await
         }
@@ -339,16 +345,57 @@ async fn get_manifest(
         return RegistryError::manifest_unknown(reference).into_response();
     }
 
-    // 3. Tag-addressed and not local. Check upstream tag cache, then upstream.
-    if let Some(digest) = state.upstream_tag_cache.get(repo, reference) {
-        match state.storage.blob_meta(repo, &digest).await {
-            Ok(Some(_)) => {
-                return serve_local_manifest(state, repo, &digest, reference, with_body).await;
+    // 3. Tag-addressed and not local. Check upstream tag cache + freshness.
+    use crate::state::TagCacheState;
+    let cache_state = state.upstream_tag_cache.lookup(repo, reference);
+    let upstream = state.upstreams.route(repo);
+
+    match (&cache_state, upstream) {
+        // Fresh cache hit + manifest still in CAS — serve immediately, no upstream.
+        (TagCacheState::Fresh(digest), _) => {
+            if let Ok(Some(_)) = state.storage.blob_meta(repo, digest).await {
+                return serve_local_manifest(state, repo, digest, reference, with_body).await;
             }
-            Ok(None) => {}
-            Err(e) => return internal_err(e),
+            // Fresh entry but blob was GC'd; fall through to a fresh fetch.
         }
+        // Stale cache hit + upstream available — try cheap HEAD to revalidate.
+        (TagCacheState::Stale(digest), Some(upstream)) => {
+            match upstream.client.resolve_tag(repo, reference).await {
+                Ok(new_digest) if &new_digest == digest => {
+                    // Unchanged upstream — refresh TTL and serve local.
+                    state.upstream_tag_cache.touch(repo, reference);
+                    if let Ok(Some(_)) = state.storage.blob_meta(repo, digest).await {
+                        return serve_local_manifest(
+                            state, repo, digest, reference, with_body,
+                        )
+                        .await;
+                    }
+                    // Lost the local copy; fall through to full fetch.
+                }
+                Ok(_new_digest) => {
+                    // Tag moved upstream — fall through to full upstream fetch.
+                }
+                Err(e) => {
+                    // Upstream unreachable — serve stale-but-cached.
+                    warn!(error = %e, "upstream HEAD failed for stale tag; serving cached");
+                    if let Ok(Some(_)) = state.storage.blob_meta(repo, digest).await {
+                        return serve_local_manifest(
+                            state, repo, digest, reference, with_body,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        // Stale + no upstream configured: serve cached (best-effort).
+        (TagCacheState::Stale(digest), None) => {
+            if let Ok(Some(_)) = state.storage.blob_meta(repo, digest).await {
+                return serve_local_manifest(state, repo, digest, reference, with_body).await;
+            }
+        }
+        (TagCacheState::Miss, _) => {}
     }
+
     if let Some(upstream) = state.upstreams.route(repo) {
         return fetch_and_serve_upstream_manifest(state, upstream, repo, reference, with_body)
             .await;
@@ -456,16 +503,19 @@ fn sniff_manifest_content_type(bytes: &[u8]) -> String {
 // ---------- tags ----------
 
 async fn list_tags(state: &RegistryState, repo: &str) -> Response {
-    // Local tags only for now. Phase 4 polish merges with upstream tags/list.
-    let tags: Vec<String> = state
-        .local_tags
-        .list_for_repo(repo)
-        .into_iter()
-        .map(|(t, _)| t)
-        .collect();
+    use std::collections::BTreeSet;
+    let mut tags: BTreeSet<String> = BTreeSet::new();
+    // Locally-pushed tags always appear first conceptually, but the OCI spec
+    // doesn't mandate ordering — we sort lexicographically for determinism.
+    for (t, _) in state.local_tags.list_for_repo(repo) {
+        tags.insert(t);
+    }
+    for t in state.upstream_tag_cache.list_for_repo(repo) {
+        tags.insert(t);
+    }
     let body = serde_json::json!({
         "name": repo,
-        "tags": tags,
+        "tags": tags.into_iter().collect::<Vec<_>>(),
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -621,6 +671,17 @@ async fn put_manifest(
         }
     }
 
+    // Validate referenced blobs exist locally before persisting (catches
+    // misordered pushes where the manifest is PUT before its layers).
+    if let Some(missing) = check_manifest_blobs_present(state, repo, &bytes).await {
+        return RegistryError::new(
+            StatusCode::BAD_REQUEST,
+            crate::RegistryErrorCode::ManifestInvalid,
+            format!("manifest references missing blob: {missing}"),
+        )
+        .into_response();
+    }
+
     // Persist manifest by digest.
     if let Err(e) = state.storage.put_blob_buffered(repo, &digest, bytes).await {
         return internal_err(e);
@@ -697,6 +758,41 @@ async fn delete_manifest(state: &RegistryState, repo: &str, reference: &str) -> 
     }
 }
 
+/// Check that every blob referenced by a manifest already exists locally.
+/// Returns `Some(digest_str)` for the first missing blob, or `None` if all
+/// referenced blobs are present. Image-index manifests reference other
+/// manifests, which we treat as soft references (not validated here) — they
+/// might be pulled-through on demand.
+async fn check_manifest_blobs_present(
+    state: &RegistryState,
+    repo: &str,
+    manifest_bytes: &[u8],
+) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(manifest_bytes).ok()?;
+    let mut required: Vec<String> = Vec::new();
+    if let Some(d) = v.get("config").and_then(|c| c.get("digest")).and_then(|d| d.as_str()) {
+        required.push(d.to_string());
+    }
+    if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
+        for layer in layers {
+            if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
+                required.push(d.to_string());
+            }
+        }
+    }
+    for d_str in required {
+        let parsed = match Digest::parse(&d_str) {
+            Ok(d) => d,
+            Err(_) => return Some(d_str),
+        };
+        match state.storage.blob_meta(repo, &parsed).await {
+            Ok(Some(_)) => continue,
+            _ => return Some(d_str),
+        }
+    }
+    None
+}
+
 // ---------- helpers ----------
 
 async fn collect_body(body: Body, max_bytes: u64) -> Result<Bytes, Response> {
@@ -720,6 +816,42 @@ async fn collect_body(body: Body, max_bytes: u64) -> Result<Bytes, Response> {
         )
         .into_response()),
     }
+}
+
+/// If a `GET /manifests/...` response carries a `Docker-Content-Digest` header
+/// that matches the request's `If-None-Match`, downgrade it to a 304 Not
+/// Modified. Mirrors browser-style conditional GET semantics.
+fn apply_if_none_match(req_headers: &HeaderMap, mut resp: Response) -> Response {
+    let inm = match req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(v) => v.trim().trim_matches('"').to_string(),
+        None => return resp,
+    };
+    let digest = match resp
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(d) => d.to_string(),
+        None => return resp,
+    };
+    if inm != digest {
+        return resp;
+    }
+    let mut new = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .body(Body::empty())
+        .expect("static");
+    // Echo the etag-equivalent header so clients can see what was matched.
+    if let Ok(v) = HeaderValue::from_str(&digest) {
+        new.headers_mut().insert("Docker-Content-Digest", v.clone());
+        new.headers_mut().insert(header::ETAG, v);
+    }
+    // Drop any body the original response may have had.
+    let _ = resp.body_mut();
+    new
 }
 
 fn internal_err(e: impl std::fmt::Display) -> Response {

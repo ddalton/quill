@@ -185,7 +185,7 @@ impl UploadStore {
             .clone();
 
         let (data_path, hex, total) = {
-            let mut s = state_arc.lock();
+            let s = state_arc.lock();
             if s.finalized {
                 return Err(UploadError::AlreadyFinalized);
             }
@@ -210,10 +210,8 @@ impl UploadStore {
         fs::rename(&data_path, &final_path).await?;
 
         {
-            let mut s = state_arc.lock();
-            s.finalized = true;
-            // touch fields to silence unused-write lint; the real signal is the dashmap remove below.
-            let _ = &s.meta;
+            let mut guard = state_arc.lock();
+            guard.finalized = true;
         }
         // Cleanup
         let _ = fs::remove_file(self.meta_path(repo, session)).await;

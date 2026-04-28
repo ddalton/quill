@@ -7,9 +7,20 @@ use quill_pullthrough::PullThroughTable;
 use quill_storage::{Digest, LocalStorage, LocalTagsStore, UploadStore};
 use quill_upstream::UpstreamRouter;
 
+/// State of an `(repo, tag)` entry in the upstream cache.
+#[derive(Debug, Clone)]
+pub enum TagCacheState {
+    /// Within freshness TTL — serve local immediately.
+    Fresh(Digest),
+    /// Past freshness TTL — caller should HEAD upstream to revalidate.
+    Stale(Digest),
+    /// Not in cache.
+    Miss,
+}
+
 /// In-memory cache of upstream-resolved tags. (repo, tag) -> (digest, fetched_at).
-/// Phase 4 will add TTL-based revalidation; for Phase 3 we cache for the
-/// configured TTL and serve directly until then.
+/// Distinguishes Fresh / Stale / Miss so the route handler can decide whether
+/// to revalidate via HEAD.
 pub struct UpstreamTagCache {
     entries: DashMap<(String, String), (Digest, std::time::Instant)>,
     ttl: Duration,
@@ -23,14 +34,29 @@ impl UpstreamTagCache {
         }
     }
 
-    pub fn get(&self, repo: &str, tag: &str) -> Option<Digest> {
-        let entry = self
+    pub fn lookup(&self, repo: &str, tag: &str) -> TagCacheState {
+        match self
             .entries
-            .get(&(repo.to_string(), tag.to_string()))?;
-        if entry.1.elapsed() < self.ttl {
-            Some(entry.0.clone())
-        } else {
-            None
+            .get(&(repo.to_string(), tag.to_string()))
+            .map(|e| e.clone())
+        {
+            None => TagCacheState::Miss,
+            Some((digest, fetched_at)) => {
+                if fetched_at.elapsed() < self.ttl {
+                    TagCacheState::Fresh(digest)
+                } else {
+                    TagCacheState::Stale(digest)
+                }
+            }
+        }
+    }
+
+    /// Convenience for callers that don't care about freshness — returns
+    /// `Some(digest)` if the entry exists at all (fresh or stale), `None` on miss.
+    pub fn get_any(&self, repo: &str, tag: &str) -> Option<Digest> {
+        match self.lookup(repo, tag) {
+            TagCacheState::Fresh(d) | TagCacheState::Stale(d) => Some(d),
+            TagCacheState::Miss => None,
         }
     }
 
@@ -39,6 +65,25 @@ impl UpstreamTagCache {
             (repo.to_string(), tag.to_string()),
             (digest, std::time::Instant::now()),
         );
+    }
+
+    /// Refresh the timestamp without changing the digest (used after a successful
+    /// upstream HEAD that confirmed the digest is still current).
+    pub fn touch(&self, repo: &str, tag: &str) {
+        let key = (repo.to_string(), tag.to_string());
+        if let Some(mut entry) = self.entries.get_mut(&key) {
+            entry.1 = std::time::Instant::now();
+        }
+    }
+
+    /// Iterate all currently-cached `(tag, digest)` pairs for a repo. Used by
+    /// `tags/list` to merge with locally-pushed tags.
+    pub fn list_for_repo(&self, repo: &str) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|kv| kv.key().0 == repo)
+            .map(|kv| kv.key().1.clone())
+            .collect()
     }
 }
 

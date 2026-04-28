@@ -36,6 +36,27 @@ enum Command {
         #[arg(short, long, default_value = "quill.toml")]
         config: PathBuf,
     },
+    /// Report total disk usage of cached blobs.
+    Du {
+        #[arg(short, long, default_value = "quill.toml")]
+        config: PathBuf,
+    },
+    /// Mark-and-sweep garbage collection of unreferenced blobs. Roots are the
+    /// digests in every repo's `_local_tags.json` (locally-pushed tags).
+    Gc {
+        #[arg(short, long, default_value = "quill.toml")]
+        config: PathBuf,
+        /// Don't delete anything; just report what would happen.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a repo entirely from the cache (blobs + local tags).
+    CacheRm {
+        #[arg(short, long, default_value = "quill.toml")]
+        config: PathBuf,
+        /// Repo name, e.g. "library/redis".
+        repo: String,
+    },
 }
 
 #[tokio::main]
@@ -50,6 +71,75 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Command::Serve { config } => serve(config).await,
+        Command::Du { config } => cmd_du(config).await,
+        Command::Gc { config, dry_run } => cmd_gc(config, dry_run).await,
+        Command::CacheRm { config, repo } => cmd_cache_rm(config, repo).await,
+    }
+}
+
+async fn cmd_du(config: PathBuf) -> Result<()> {
+    use quill_storage::GarbageCollector;
+    let cfg = Config::from_file(&config)
+        .with_context(|| format!("loading config from {}", config.display()))?;
+    let layout = CasLayout::new(&cfg.storage.root);
+    let gc = GarbageCollector::new(layout);
+    let bytes = gc.disk_usage().await?;
+    println!("{}\t{}", format_bytes(bytes), cfg.storage.root.display());
+    Ok(())
+}
+
+async fn cmd_gc(config: PathBuf, dry_run: bool) -> Result<()> {
+    use quill_storage::GarbageCollector;
+    let cfg = Config::from_file(&config)
+        .with_context(|| format!("loading config from {}", config.display()))?;
+    let layout = CasLayout::new(&cfg.storage.root);
+    let gc = GarbageCollector::new(layout);
+    let report = gc.run(std::collections::HashSet::new(), dry_run).await?;
+    let mode = if dry_run { "dry-run" } else { "live" };
+    println!(
+        "{mode}: scanned {} repo(s), {} root(s), {} reachable, {} on-disk, {} deleted ({} freed){}",
+        report.repos_scanned,
+        report.roots,
+        report.reachable_blobs,
+        report.on_disk_blobs,
+        report.deleted,
+        format_bytes(report.bytes_freed),
+        if report.errors.is_empty() {
+            String::new()
+        } else {
+            format!("\nerrors: {}", report.errors.join("\n  "))
+        }
+    );
+    Ok(())
+}
+
+async fn cmd_cache_rm(config: PathBuf, repo: String) -> Result<()> {
+    let cfg = Config::from_file(&config)
+        .with_context(|| format!("loading config from {}", config.display()))?;
+    let layout = CasLayout::new(&cfg.storage.root);
+    let dir = layout.repo_dir(&repo);
+    if !dir.exists() {
+        anyhow::bail!("repo {repo} not present in cache at {}", dir.display());
+    }
+    tokio::fs::remove_dir_all(&dir)
+        .await
+        .with_context(|| format!("removing {}", dir.display()))?;
+    println!("removed {}", dir.display());
+    Ok(())
+}
+
+fn format_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} {}", UNITS[0])
+    } else {
+        format!("{:.2} {}", v, UNITS[i])
     }
 }
 

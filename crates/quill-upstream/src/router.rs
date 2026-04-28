@@ -40,6 +40,13 @@ impl UpstreamRouter {
         Self { entries: vec![] }
     }
 
+    /// Construct from pre-built entries. Used by integration tests that
+    /// inject a mock upstream client. Not intended for production.
+    #[doc(hidden)]
+    pub fn __with_entries_for_test(entries: Vec<Arc<UpstreamEntry>>) -> Self {
+        Self { entries }
+    }
+
     /// Find the first upstream whose `repo_prefix` is a prefix of `repo`.
     pub fn route(&self, repo: &str) -> Option<&Arc<UpstreamEntry>> {
         self.entries

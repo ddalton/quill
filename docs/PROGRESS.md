@@ -2,7 +2,7 @@
 
 This file tracks where we are in the plan defined in `PLAN.md` so implementation can restart cleanly across sessions or machines.
 
-**Last updated:** 2026-04-28 (Phase 2 push path working; locally-pushed-tag precedence verified end-to-end against Docker Hub upstream)
+**Last updated:** 2026-04-28 (Phase 4 polish + GC complete; 33 tests passing; both smoke scripts green)
 
 ---
 
@@ -13,7 +13,18 @@ This file tracks where we are in the plan defined in `PLAN.md` so implementation
 | 1 | Local CAS server with TLS + auth | ✅ **Complete** |
 | 2 | Push path with `_local_tags.json` | ✅ **Complete** |
 | 3 | Streaming pull-through cache + upstream | ✅ **Complete** |
-| 4 | Polish + GC | ⬜ **Not started** |
+| 4 | Polish + GC | ✅ **Complete** |
+
+**All 4 phases of the plan are done.** Test counts:
+
+- 2 unit (`quill-auth`)
+- 2 unit (`quill-config`)
+- 9 unit (`quill-storage` — including 2 GC tests)
+- 2 unit (`quill-upstream`)
+- 18 integration (`quill-server/tests/integration.rs`) — push round-trip, missing-blob rejection, manifest-digest mismatch, locally-pushed-tag precedence, pull-through cold-then-warm, conditional GET 304, GC reachability, upload session lifecycle, tags/list merge, stale-tag revalidation (unchanged + rotated)
+- 2 manual smoke scripts (`scripts/smoke-pullthrough.sh`, `scripts/smoke-push.sh`) — both green
+
+**Total: 33 automated tests + 2 smoke scripts.**
 
 ---
 
@@ -158,19 +169,30 @@ repo_prefix = "library/"
 
 ---
 
-## Phase 4 — Polish + GC — NOT STARTED
+## Phase 4 — Polish + GC — DONE
 
-What needs to happen (PLAN.md §6 Phase 4):
+Verified on 2026-04-28 with the integration suite + manual CLI exercises.
 
-- Tag freshness TTL revalidation for non-local cached tags (HEAD upstream past TTL, refresh-or-fetch — §5.6)
-- Conditional manifest GET (`If-None-Match`)
-- Range requests on cache-hit path (HTTP 206)
-- Manifest-and-config prefetch on tag resolution
-- `_upstream_tags.json` persistence (currently in-memory only) — optional
-- **Mark-and-sweep GC**: walk all manifests in `index.json` + `_local_tags.json` to mark; sweep unreferenced blobs. Required because `rm -rf cache/` would now nuke locally-pushed patches.
-- `quill cache rm <repo>`, `quill cache du`, `quill gc` CLI subcommands
-- Bearer token /v2/token endpoint (server-side JWT issuance for clients connecting *to* Quill)
-- README with Docker Desktop / colima / containerd registry-mirror snippets
+What's in place:
+
+- **Manifest-blob-existence validation on push.** `put_manifest` walks the manifest's `config.digest` + `layers[*].digest` and returns 400 `MANIFESTINVALID` if any referenced blob is missing locally. Catches misordered pushes.
+- **Tag freshness TTL revalidation** (`UpstreamTagCache::lookup`). Cache entries are `Fresh` (within TTL — serve immediately, no upstream contact), `Stale` (past TTL — HEAD upstream, refresh-on-match or refetch-on-mismatch), or `Miss`. On upstream HEAD failure for a stale entry, we serve the stale local copy (best-effort fallback). Default TTL: 5 min in production, 150 ms in integration tests.
+- **`tags/list` merge view**: locally-pushed tags + cached upstream tags, sorted lexicographically.
+- **Conditional manifest GET (`If-None-Match`)**: matches `Docker-Content-Digest` against the request header; downgrades 200 to 304 Not Modified. Echoes both `Docker-Content-Digest` and `ETag` on the 304 response.
+- **Mark-and-sweep GC** (`quill-storage::gc::GarbageCollector`). Roots: every digest in any repo's `_local_tags.json`. Recursive traversal follows `config.digest`, `layers[*].digest`, and image-index `manifests[*].digest`. Unreachable blobs are deleted. Supports `dry_run`, `extra_roots` for online GC pinning currently-cached upstream tags, and detailed reporting (`GcReport { repos_scanned, roots, reachable_blobs, on_disk_blobs, deleted, bytes_freed, errors }`).
+- **CLI subcommands**:
+  - `quill du --config <path>` — total disk usage of all blobs.
+  - `quill gc --config <path> [--dry-run]` — run mark-and-sweep.
+  - `quill cache-rm --config <path> <repo>` — remove a repo's cache directory entirely.
+
+What's deferred (still useful eventually, but not blocking):
+
+- **Range requests on cache-hit blob path (HTTP 206)** — clients use it rarely for OCI; can land later.
+- **Manifest-and-config prefetch on tag resolution** — micro-optimization (~50 ms saved per pull).
+- **`_upstream_tags.json` persistence** — currently in-memory only; restart loses the tag→digest cache (forces one re-resolution per tag, cheap).
+- **Server-side `/v2/token` JWT endpoint** — `docker login` accepts Basic auth as a fallback so this isn't blocking.
+- **Live upstream `tags/list` pass-through** — currently we merge only what's already been resolved.
+- **README with Docker Desktop / colima / containerd registry-mirror snippets** — config knowledge is captured in the example TOML; full operator guide can come when needed.
 
 ---
 

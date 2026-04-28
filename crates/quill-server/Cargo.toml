@@ -35,3 +35,23 @@ quill-registry = { workspace = true }
 quill-storage = { workspace = true }
 quill-tls = { workspace = true }
 quill-upstream = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+quill-config = { workspace = true }
+quill-pullthrough = { workspace = true }
+quill-registry = { workspace = true }
+quill-storage = { workspace = true }
+quill-upstream = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+tower = { workspace = true }
