@@ -503,13 +503,25 @@ fn sniff_manifest_content_type(bytes: &[u8]) -> String {
 async fn list_tags(state: &RegistryState, repo: &str) -> Response {
     use std::collections::BTreeSet;
     let mut tags: BTreeSet<String> = BTreeSet::new();
-    // Locally-pushed tags always appear first conceptually, but the OCI spec
-    // doesn't mandate ordering — we sort lexicographically for determinism.
     for (t, _) in state.local_tags.list_for_repo(repo) {
         tags.insert(t);
     }
     for t in state.upstream_tag_cache.list_for_repo(repo) {
         tags.insert(t);
+    }
+    if tags.is_empty() {
+        if let Some(upstream) = state.upstreams.route(repo) {
+            match upstream.client.list_tags(repo).await {
+                Ok(upstream_tags) => {
+                    for t in upstream_tags {
+                        tags.insert(t);
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, repo, "upstream tag list failed");
+                }
+            }
+        }
     }
     let body = serde_json::json!({
         "name": repo,

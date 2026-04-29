@@ -324,6 +324,18 @@ impl UpstreamClient for MockUpstream {
         let stream = stream::iter(vec![Ok::<_, reqwest::Error>(body)]);
         Ok(Box::pin(stream))
     }
+
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, UpstreamError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let tags: Vec<String> = self
+            .fixtures
+            .tags
+            .iter()
+            .filter(|e| e.key().0 == repo)
+            .map(|e| e.key().1.clone())
+            .collect();
+        Ok(tags)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +886,44 @@ async fn manifest_put_with_mismatched_digest_reference_returns_400() {
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn tags_list_proxies_to_upstream_for_never_pulled_repo() {
+    let fx = Fixture::new_with_mock_upstream("library/");
+    let mock = fx.mock.clone();
+
+    // Upstream has tags for a repo that has never been pulled through quill.
+    let up_layer = mock.add_blob("library/newrepo", Bytes::from(&b"L"[..]));
+    let up_config = mock.add_blob("library/newrepo", Bytes::from(&b"{}"[..]));
+    let up_manifest = build_manifest(&up_config, &[(up_layer, 1)]);
+    let up_d = mock.add_manifest(
+        "library/newrepo",
+        &up_manifest,
+        "application/vnd.oci.image.manifest.v1+json",
+    );
+    mock.tag("library/newrepo", "v1.0", &up_d);
+    mock.tag("library/newrepo", "latest", &up_d);
+
+    // Without pulling any manifest, tags/list should proxy to upstream.
+    let (status, _, body) = fx
+        .req(
+            Method::GET,
+            "/v2/library/newrepo/tags/list",
+            vec![],
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let tags: Vec<&str> = v["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert!(tags.contains(&"v1.0"), "tags={tags:?}");
+    assert!(tags.contains(&"latest"), "tags={tags:?}");
 }
 
 #[tokio::test]

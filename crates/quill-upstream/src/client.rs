@@ -51,6 +51,7 @@ pub trait UpstreamClient: Send + Sync {
         repo: &str,
         digest: &Digest,
     ) -> Result<BlobStream, UpstreamError>;
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, UpstreamError>;
 }
 
 /// Erased blob byte stream returned by the upstream.
@@ -236,6 +237,31 @@ impl UpstreamClient for HttpUpstream {
             });
         }
         Ok(Box::pin(resp.bytes_stream()))
+    }
+
+    #[instrument(skip(self), fields(upstream = %self.name, repo))]
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, UpstreamError> {
+        let url = self.url_for(&format!("/v2/{repo}/tags/list"))?;
+        let resp = self
+            .send_with_auth(reqwest::Method::GET, url.clone(), None)
+            .await?;
+        if !resp.status().is_success() {
+            return Err(UpstreamError::Status {
+                status: resp.status().as_u16(),
+                url: url.to_string(),
+            });
+        }
+        let body: serde_json::Value = resp.json().await.map_err(UpstreamError::Transport)?;
+        let tags = body
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(tags)
     }
 }
 
