@@ -48,6 +48,10 @@ impl CasLayout {
         self.repo_dir(repo).join("_local_tags.json")
     }
 
+    pub fn upstream_tags_path(&self, repo: &str) -> PathBuf {
+        self.repo_dir(repo).join("_upstream_tags.json")
+    }
+
     pub fn uploads_dir(&self, repo: &str) -> PathBuf {
         self.repo_dir(repo).join("_uploads")
     }
@@ -56,6 +60,40 @@ impl CasLayout {
         let repo_dir = self.repo_dir(repo);
         std::fs::create_dir_all(repo_dir.join("blobs").join("sha256"))?;
         std::fs::create_dir_all(repo_dir.join("_uploads"))?;
+        Ok(())
+    }
+
+    pub fn list_repos(&self) -> std::io::Result<Vec<String>> {
+        let mut repos = Vec::new();
+        self.walk_repos(&self.root, &mut repos)?;
+        repos.sort();
+        Ok(repos)
+    }
+
+    fn walk_repos(&self, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || name_str.starts_with('_') {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.join("blobs").is_dir() {
+                if let Ok(rel) = path.strip_prefix(&self.root) {
+                    out.push(rel.to_string_lossy().into_owned());
+                }
+            }
+            self.walk_repos(&path, out)?;
+        }
         Ok(())
     }
 }

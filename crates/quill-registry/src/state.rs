@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
+use tracing::warn;
 
 use quill_pullthrough::PullThroughTable;
-use quill_storage::{Digest, LocalStorage, LocalTagsStore, UploadStore};
+use quill_storage::{CasLayout, Digest, LocalStorage, LocalTagsStore, UploadStore};
 use quill_upstream::UpstreamRouter;
 
 /// State of an `(repo, tag)` entry in the upstream cache.
@@ -20,17 +22,47 @@ pub enum TagCacheState {
 
 /// In-memory cache of upstream-resolved tags. (repo, tag) -> (digest, fetched_at).
 /// Distinguishes Fresh / Stale / Miss so the route handler can decide whether
-/// to revalidate via HEAD.
+/// to revalidate via HEAD. Persisted to `_upstream_tags.json` per repo so that
+/// tags survive restarts.
 pub struct UpstreamTagCache {
     entries: DashMap<(String, String), (Digest, std::time::Instant)>,
     ttl: Duration,
+    layout: Option<CasLayout>,
 }
 
 impl UpstreamTagCache {
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: Duration, layout: Option<CasLayout>) -> Self {
         Self {
             entries: DashMap::new(),
             ttl,
+            layout,
+        }
+    }
+
+    pub fn load_repo(&self, repo: &str) {
+        let layout = match &self.layout {
+            Some(l) => l,
+            None => return,
+        };
+        let path = layout.upstream_tags_path(repo);
+        let body = match std::fs::read_to_string(&path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let map: HashMap<String, String> = match serde_json::from_str(&body) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, repo, "failed to parse _upstream_tags.json");
+                return;
+            }
+        };
+        for (tag, digest_str) in map {
+            if let Ok(digest) = Digest::parse(&digest_str) {
+                self.entries.insert(
+                    (repo.to_string(), tag),
+                    (digest, std::time::Instant::now()),
+                );
+            }
         }
     }
 
@@ -65,6 +97,7 @@ impl UpstreamTagCache {
             (repo.to_string(), tag.to_string()),
             (digest, std::time::Instant::now()),
         );
+        self.persist_repo(repo);
     }
 
     /// Refresh the timestamp without changing the digest (used after a successful
@@ -84,6 +117,29 @@ impl UpstreamTagCache {
             .filter(|kv| kv.key().0 == repo)
             .map(|kv| kv.key().1.clone())
             .collect()
+    }
+
+    fn persist_repo(&self, repo: &str) {
+        let layout = match &self.layout {
+            Some(l) => l,
+            None => return,
+        };
+        let snapshot: HashMap<String, String> = self
+            .entries
+            .iter()
+            .filter(|kv| kv.key().0 == repo)
+            .map(|kv| (kv.key().1.clone(), kv.value().0.to_string()))
+            .collect();
+        let path = layout.upstream_tags_path(repo);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Ok(body) = serde_json::to_vec_pretty(&snapshot) {
+            if std::fs::write(&tmp, body).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
     }
 }
 

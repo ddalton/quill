@@ -178,7 +178,11 @@ async fn serve(config_path: PathBuf) -> Result<()> {
     } else {
         info!(count = cfg.upstream.len(), "configured upstreams");
     }
-    let upstream_tag_cache = Arc::new(UpstreamTagCache::new(Duration::from_secs(300)));
+    let upstream_tag_cache = Arc::new(UpstreamTagCache::new(
+        Duration::from_secs(300),
+        Some(layout.clone()),
+    ));
+    load_existing_upstream_tags(&upstream_tag_cache, &cfg.storage.root);
 
     // --- auth ---
     let htpasswd_store = match cfg
@@ -291,6 +295,35 @@ async fn serve_conn(
         }
     }
     Ok(())
+}
+
+fn load_existing_upstream_tags(cache: &Arc<UpstreamTagCache>, root: &std::path::Path) {
+    if !root.exists() {
+        return;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if entry.file_name() == "blobs" || entry.file_name() == "_uploads" {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.file_name().is_some_and(|n| n == "_upstream_tags.json") {
+                if let Some(repo_dir) = p.parent() {
+                    if let Ok(repo_rel) = repo_dir.strip_prefix(root) {
+                        let repo_str = repo_rel.to_string_lossy().to_string();
+                        cache.load_repo(&repo_str);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn load_existing_local_tags(store: &Arc<LocalTagsStore>, root: &std::path::Path) -> Result<()> {

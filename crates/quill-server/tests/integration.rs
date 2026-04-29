@@ -59,7 +59,7 @@ impl Fixture {
         let local_tags = Arc::new(LocalTagsStore::new(layout.clone()));
         let uploads = Arc::new(UploadStore::new(layout.clone()));
         let pullthrough = Arc::new(PullThroughTable::new());
-        let upstream_tag_cache = Arc::new(UpstreamTagCache::new(Duration::from_millis(150)));
+        let upstream_tag_cache = Arc::new(UpstreamTagCache::new(Duration::from_millis(150), None));
 
         let (upstreams, mock_calls, mock) = match upstream {
             Some((prefix, mock)) => {

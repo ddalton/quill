@@ -88,6 +88,10 @@ async fn dispatch(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if rest == "_catalog" {
+        return catalog(&state).await;
+    }
+
     let (repo, action) = match split(&rest) {
         Some(p) => p,
         None => return RegistryError::name_unknown(rest.clone()).into_response(),
@@ -279,18 +283,12 @@ async fn serve_blob_via_pullthrough(
                 );
                 (StatusCode::OK, h).into_response()
             }
-            Some(quill_pullthrough::ProducerOutcome::Failed(e)) => RegistryError::new(
-                StatusCode::BAD_GATEWAY,
-                crate::RegistryErrorCode::Unavailable,
-                e.to_string(),
-            )
-            .into_response(),
-            None => RegistryError::new(
-                StatusCode::BAD_GATEWAY,
-                crate::RegistryErrorCode::Unavailable,
-                "producer did not complete",
-            )
-            .into_response(),
+            Some(quill_pullthrough::ProducerOutcome::Failed(_)) => {
+                RegistryError::blob_unknown(&digest.to_string()).into_response()
+            }
+            None => {
+                RegistryError::blob_unknown(&digest.to_string()).into_response()
+            }
         }
     } else {
         let body = PullThroughBody::new(entry.clone());
@@ -517,6 +515,24 @@ async fn list_tags(state: &RegistryState, repo: &str) -> Response {
         "name": repo,
         "tags": tags.into_iter().collect::<Vec<_>>(),
     });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+// ---------- catalog ----------
+
+async fn catalog(state: &RegistryState) -> Response {
+    let repos = match state.storage.layout().list_repos() {
+        Ok(r) => r,
+        Err(e) => return internal_err(e),
+    };
+    let repos: Vec<String> = repos
+        .into_iter()
+        .filter(|r| {
+            !state.local_tags.list_for_repo(r).is_empty()
+                || !state.upstream_tag_cache.list_for_repo(r).is_empty()
+        })
+        .collect();
+    let body = serde_json::json!({ "repositories": repos });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
