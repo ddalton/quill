@@ -439,13 +439,8 @@ async fn fetch_and_serve_upstream_manifest(
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "upstream manifest fetch failed");
-            return RegistryError::new(
-                StatusCode::BAD_GATEWAY,
-                crate::RegistryErrorCode::Unavailable,
-                e.to_string(),
-            )
-            .into_response();
+            debug!(error = %e, "upstream manifest fetch failed, treating as not found");
+            return RegistryError::manifest_unknown(reference).into_response();
         }
     };
 
