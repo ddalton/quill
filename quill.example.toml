@@ -25,6 +25,32 @@ blob_meta_ttl_secs = 60
 # the matching upstream. Phase 3 wires up actual fetching; Phase 1 parses these
 # but only serves from local CAS.
 #
+# Optional `rewrite_prefix`: by default the matched repo path is forwarded to the
+# upstream verbatim (transparent proxy). Set `rewrite_prefix` to replace the
+# matched `repo_prefix` before the request is sent upstream — use "" to strip it
+# entirely, or another path to remap it. This lets an OCI endpoint that carries
+# an extra path component proxy to a differently-laid-out upstream, e.g.
+# `jfrog.registry.example.com/cloudera-oci-virtual` -> `docker-sandbox.example.com`:
+#
+# [[upstream]]
+# name = "sandbox"
+# url = "https://docker-sandbox.example.com"
+# kind = "generic"
+# repo_prefix = "cloudera-oci-virtual/"
+# rewrite_prefix = ""            # cloudera-oci-virtual/cloudera/img -> cloudera/img
+#
+# Optional `fallback_url`: a secondary registry tried when the primary `url`
+# returns not-found (404) or is unreachable, using the same (rewritten) repo
+# path. Real 5xx errors from the primary still surface. Handy when the primary is
+# a partial mirror (e.g. a dev sandbox) and a broader registry has the rest:
+#
+# fallback_url = "https://docker-private.example.com"
+#
+# [upstream.fallback_auth]        # credentials for fallback_url, if it needs them
+# type = "basic"
+# username = "ci"
+# password = "redacted"
+#
 # --- ECR ---
 # ECR uses HTTP basic auth: username is the literal string "AWS", password is
 # the 12-hour token from `aws ecr get-login-password --region <region>`. Refresh

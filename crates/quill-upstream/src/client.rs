@@ -265,10 +265,228 @@ impl UpstreamClient for HttpUpstream {
     }
 }
 
+/// Whether a primary-upstream error should trigger a fallback attempt.
+/// Falls back on not-found (404) and transport/unreachable errors; real 5xx and
+/// auth errors from the primary surface as errors instead of masking a problem.
+fn should_fallback(e: &UpstreamError) -> bool {
+    matches!(
+        e,
+        UpstreamError::Status { status: 404, .. } | UpstreamError::Transport(_)
+    )
+}
+
+/// Wraps a primary upstream with a fallback that is tried when the primary
+/// returns not-found or is unreachable. The same (already-rewritten) repo path
+/// is used for both, so the fallback must lay the repo out identically.
+pub struct FallbackUpstream {
+    primary: Arc<dyn UpstreamClient>,
+    fallback: Arc<dyn UpstreamClient>,
+}
+
+impl FallbackUpstream {
+    pub fn new(primary: Arc<dyn UpstreamClient>, fallback: Arc<dyn UpstreamClient>) -> Arc<Self> {
+        Arc::new(Self { primary, fallback })
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for FallbackUpstream {
+    async fn resolve_tag(&self, repo: &str, reference: &str) -> Result<Digest, UpstreamError> {
+        match self.primary.resolve_tag(repo, reference).await {
+            Err(e) if should_fallback(&e) => {
+                debug!(error = %e, "primary resolve_tag failed, trying fallback");
+                self.fallback.resolve_tag(repo, reference).await
+            }
+            other => other,
+        }
+    }
+
+    async fn get_manifest(
+        &self,
+        repo: &str,
+        reference: &str,
+    ) -> Result<ManifestResponse, UpstreamError> {
+        match self.primary.get_manifest(repo, reference).await {
+            Err(e) if should_fallback(&e) => {
+                debug!(error = %e, "primary get_manifest failed, trying fallback");
+                self.fallback.get_manifest(repo, reference).await
+            }
+            other => other,
+        }
+    }
+
+    async fn stream_blob(
+        &self,
+        repo: &str,
+        digest: &Digest,
+    ) -> Result<BlobStream, UpstreamError> {
+        match self.primary.stream_blob(repo, digest).await {
+            Err(e) if should_fallback(&e) => {
+                debug!(error = %e, "primary stream_blob failed, trying fallback");
+                self.fallback.stream_blob(repo, digest).await
+            }
+            other => other,
+        }
+    }
+
+    async fn list_tags(&self, repo: &str) -> Result<Vec<String>, UpstreamError> {
+        // Tags are unioned across primary + fallback (not primary-first): a
+        // version may exist on only one registry (e.g. release builds on the
+        // fallback, dev builds on the primary), and the resolver needs to see
+        // all of them. A later manifest/blob pull for a specific tag still falls
+        // back on 404. If the primary hard-fails (non-fallback error), surface it.
+        let primary = self.primary.list_tags(repo).await;
+        let fallback = self.fallback.list_tags(repo).await;
+        match (primary, fallback) {
+            (Ok(a), Ok(b)) => {
+                let mut set: std::collections::BTreeSet<String> = a.into_iter().collect();
+                set.extend(b);
+                Ok(set.into_iter().collect())
+            }
+            (Ok(a), Err(_)) => Ok(a),
+            (Err(e), Ok(b)) if should_fallback(&e) => Ok(b),
+            (Err(e), _) => Err(e),
+        }
+    }
+}
+
 fn digest_from_bytes(bytes: &[u8]) -> Digest {
     use sha2::{Digest as _, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
     let hex = hex::encode(h.finalize());
     Digest::parse(&format!("sha256:{hex}")).expect("self-computed sha256 is always valid")
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn should_fallback_matches_notfound_only() {
+        assert!(should_fallback(&UpstreamError::Status {
+            status: 404,
+            url: "x".into()
+        }));
+        assert!(!should_fallback(&UpstreamError::Status {
+            status: 500,
+            url: "x".into()
+        }));
+        assert!(!should_fallback(&UpstreamError::Status {
+            status: 401,
+            url: "x".into()
+        }));
+        assert!(!should_fallback(&UpstreamError::MissingDigest));
+    }
+
+    enum Outcome {
+        Ok,
+        Status(u16),
+    }
+
+    struct MockClient {
+        tag: String,
+        outcome: Outcome,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockClient {
+        fn new(tag: &str, outcome: Outcome) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    tag: tag.to_string(),
+                    outcome,
+                    calls: calls.clone(),
+                }),
+                calls,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl UpstreamClient for MockClient {
+        async fn resolve_tag(&self, _repo: &str, _reference: &str) -> Result<Digest, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                Outcome::Ok => Digest::parse(&format!("sha256:{}", "a".repeat(64)))
+                    .map_err(|e| UpstreamError::InvalidDigest(e.to_string())),
+                Outcome::Status(s) => Err(UpstreamError::Status {
+                    status: s,
+                    url: "mock".into(),
+                }),
+            }
+        }
+        async fn get_manifest(
+            &self,
+            _repo: &str,
+            _reference: &str,
+        ) -> Result<ManifestResponse, UpstreamError> {
+            unreachable!()
+        }
+        async fn stream_blob(
+            &self,
+            _repo: &str,
+            _digest: &Digest,
+        ) -> Result<BlobStream, UpstreamError> {
+            unreachable!()
+        }
+        async fn list_tags(&self, _repo: &str) -> Result<Vec<String>, UpstreamError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                Outcome::Ok => Ok(vec![self.tag.clone()]),
+                Outcome::Status(s) => Err(UpstreamError::Status {
+                    status: s,
+                    url: "mock".into(),
+                }),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tags_falls_back_on_primary_404() {
+        let (primary, pc) = MockClient::new("primary", Outcome::Status(404));
+        let (fallback, fc) = MockClient::new("fallback", Outcome::Ok);
+        let fb = FallbackUpstream::new(primary, fallback);
+        let tags = fb.list_tags("repo").await.unwrap();
+        assert_eq!(tags, vec!["fallback".to_string()]);
+        assert_eq!(pc.load(Ordering::SeqCst), 1);
+        assert_eq!(fc.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn list_tags_unions_primary_and_fallback() {
+        // A tag present only on the fallback (e.g. a pinned release build) must
+        // still be discoverable even though the primary repo also exists.
+        let (primary, pc) = MockClient::new("primary", Outcome::Ok);
+        let (fallback, fc) = MockClient::new("fallback", Outcome::Ok);
+        let fb = FallbackUpstream::new(primary, fallback);
+        let tags = fb.list_tags("repo").await.unwrap();
+        // BTreeSet-ordered union of both mock tags.
+        assert_eq!(tags, vec!["fallback".to_string(), "primary".to_string()]);
+        assert_eq!(pc.load(Ordering::SeqCst), 1);
+        assert_eq!(fc.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_tag_does_not_fall_back_when_primary_succeeds() {
+        let (primary, pc) = MockClient::new("primary", Outcome::Ok);
+        let (fallback, fc) = MockClient::new("fallback", Outcome::Ok);
+        let fb = FallbackUpstream::new(primary, fallback);
+        let _ = fb.resolve_tag("repo", "tag").await.unwrap();
+        assert_eq!(pc.load(Ordering::SeqCst), 1);
+        assert_eq!(fc.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn does_not_fall_back_on_primary_5xx() {
+        let (primary, pc) = MockClient::new("primary", Outcome::Status(500));
+        let (fallback, fc) = MockClient::new("fallback", Outcome::Ok);
+        let fb = FallbackUpstream::new(primary, fallback);
+        let err = fb.resolve_tag("repo", "tag").await.unwrap_err();
+        assert!(matches!(err, UpstreamError::Status { status: 500, .. }));
+        assert_eq!(pc.load(Ordering::SeqCst), 1);
+        assert_eq!(fc.load(Ordering::SeqCst), 0);
+    }
 }

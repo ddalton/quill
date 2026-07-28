@@ -81,8 +81,23 @@ pub struct Upstream {
     pub kind: UpstreamKind,
     /// Repo prefix; pulls of /v2/<prefix>/... go through this upstream.
     pub repo_prefix: String,
+    /// If set, the matched `repo_prefix` is replaced by this value before the
+    /// request is sent upstream. `Some("")` strips the prefix entirely; `None`
+    /// forwards the repo verbatim (default; preserves transparent-proxy behavior).
+    #[serde(default)]
+    pub rewrite_prefix: Option<String>,
     #[serde(default)]
     pub auth: Option<UpstreamAuth>,
+    /// Optional secondary registry tried when the primary `url` returns
+    /// not-found (404) or is unreachable. Uses the same (rewritten) repo path.
+    /// Real 5xx errors from the primary still surface as errors. Useful when the
+    /// primary is a partial mirror (e.g. dev sandbox) and a broader registry
+    /// holds the rest (e.g. docker-private).
+    #[serde(default)]
+    pub fallback_url: Option<String>,
+    /// Credentials for `fallback_url`, if it requires auth. Omit for anonymous.
+    #[serde(default)]
+    pub fallback_auth: Option<UpstreamAuth>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -149,6 +164,101 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.http.address, "127.0.0.1:5000");
         assert_eq!(cfg.storage.blob_meta_ttl_secs, 60);
+    }
+
+    #[test]
+    fn upstream_rewrite_prefix_defaults_to_none() {
+        let toml_str = r#"
+            [http]
+            address = "127.0.0.1:5000"
+
+            [storage]
+            root = "/tmp/quill"
+
+            [[upstream]]
+            name = "sandbox"
+            url = "https://docker-sandbox.infra.cloudera.com"
+            kind = "generic"
+            repo_prefix = "cloudera-oci-virtual/"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.upstream.len(), 1);
+        assert!(cfg.upstream[0].rewrite_prefix.is_none());
+    }
+
+    #[test]
+    fn upstream_rewrite_prefix_parses() {
+        let toml_str = r#"
+            [http]
+            address = "127.0.0.1:5000"
+
+            [storage]
+            root = "/tmp/quill"
+
+            [[upstream]]
+            name = "sandbox"
+            url = "https://docker-sandbox.infra.cloudera.com"
+            kind = "generic"
+            repo_prefix = "cloudera-oci-virtual/"
+            rewrite_prefix = ""
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.upstream[0].rewrite_prefix.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn upstream_fallback_parses() {
+        let toml_str = r#"
+            [http]
+            address = "127.0.0.1:5000"
+
+            [storage]
+            root = "/tmp/quill"
+
+            [[upstream]]
+            name = "sandbox"
+            url = "https://docker-sandbox.infra.cloudera.com"
+            kind = "generic"
+            repo_prefix = "cloudera-oci-virtual/"
+            rewrite_prefix = ""
+            fallback_url = "https://docker-private.infra.cloudera.com"
+
+            [upstream.fallback_auth]
+            type = "basic"
+            username = "u"
+            password = "p"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.upstream[0].fallback_url.as_deref(),
+            Some("https://docker-private.infra.cloudera.com")
+        );
+        match cfg.upstream[0].fallback_auth.as_ref().unwrap() {
+            UpstreamAuth::Basic { username, password } => {
+                assert_eq!(username, "u");
+                assert_eq!(password, "p");
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_fallback_defaults_to_none() {
+        let toml_str = r#"
+            [http]
+            address = "127.0.0.1:5000"
+
+            [storage]
+            root = "/tmp/quill"
+
+            [[upstream]]
+            name = "sandbox"
+            url = "https://docker-sandbox.infra.cloudera.com"
+            kind = "generic"
+            repo_prefix = "cloudera-oci-virtual/"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.upstream[0].fallback_url.is_none());
+        assert!(cfg.upstream[0].fallback_auth.is_none());
     }
 
     #[test]

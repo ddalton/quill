@@ -70,7 +70,10 @@ impl Fixture {
                         url: "https://mock.invalid".into(),
                         kind: quill_config::UpstreamKind::Generic,
                         repo_prefix: prefix,
+                        rewrite_prefix: None,
                         auth: None,
+                        fallback_url: None,
+                        fallback_auth: None,
                     },
                     client: mock.clone() as Arc<dyn UpstreamClient>,
                 });

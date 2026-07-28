@@ -198,10 +198,11 @@ async fn serve_blob_via_pullthrough(
     digest: Digest,
     with_body: bool,
 ) -> Response {
-    // `repo_prefix` is purely a routing selector; the full repo name is sent
-    // upstream verbatim. (Path translation is a Phase 4+ knob if anyone needs
-    // `mycorp/foo` on Quill → `account-id/foo` on ECR.)
-    let upstream_repo = repo;
+    // `repo_prefix` selects the upstream; `rewrite_prefix` (if configured on the
+    // upstream) then translates the repo path before it is sent upstream, so an
+    // OCI endpoint like `.../cloudera-oci-virtual` can proxy to a different
+    // upstream whose layout differs. Local CAS keeps keying on the original repo.
+    let upstream_repo = upstream.translate_repo(repo);
 
     // Single-flight: are we producer or subscriber?
     let layout = state.storage.layout().clone();
@@ -358,7 +359,11 @@ async fn get_manifest(
         }
         // Stale cache hit + upstream available — try cheap HEAD to revalidate.
         (TagCacheState::Stale(digest), Some(upstream)) => {
-            match upstream.client.resolve_tag(repo, reference).await {
+            match upstream
+                .client
+                .resolve_tag(&upstream.translate_repo(repo), reference)
+                .await
+            {
                 Ok(new_digest) if &new_digest == digest => {
                     // Unchanged upstream — refresh TTL and serve local.
                     state.upstream_tag_cache.touch(repo, reference);
@@ -428,10 +433,10 @@ async fn fetch_and_serve_upstream_manifest(
     reference: &str,
     with_body: bool,
 ) -> Response {
-    // `repo_prefix` is purely a routing selector; the full repo name is sent
-    // upstream verbatim. (Path translation is a Phase 4+ knob if anyone needs
-    // `mycorp/foo` on Quill → `account-id/foo` on ECR.)
-    let upstream_repo = repo;
+    // `repo_prefix` selects the upstream; `rewrite_prefix` (if set) then
+    // translates the repo path before it is sent upstream. Local CAS/tag cache
+    // continue to key on the original client-facing `repo`.
+    let upstream_repo = upstream.translate_repo(repo);
     let resp = match upstream
         .client
         .get_manifest(&upstream_repo, reference)
@@ -506,7 +511,7 @@ async fn list_tags(state: &RegistryState, repo: &str) -> Response {
     }
     if tags.is_empty() {
         if let Some(upstream) = state.upstreams.route(repo) {
-            match upstream.client.list_tags(repo).await {
+            match upstream.client.list_tags(&upstream.translate_repo(repo)).await {
                 Ok(upstream_tags) => {
                     for t in upstream_tags {
                         tags.insert(t);
