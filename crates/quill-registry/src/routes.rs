@@ -292,7 +292,7 @@ async fn serve_blob_via_pullthrough(
             }
         }
     } else {
-        let body = PullThroughBody::new(entry.clone());
+        let body = PullThroughBody::new(entry.clone()).with_final_path(final_path);
         let mut resp = Response::builder()
             .status(StatusCode::OK)
             .header("Docker-Content-Digest", digest.to_string())
