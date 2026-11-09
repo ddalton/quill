@@ -91,7 +91,10 @@ impl HttpUpstream {
             .http2_initial_stream_window_size(Some(16 * 1024 * 1024))
             .http2_initial_connection_window_size(Some(64 * 1024 * 1024))
             .http2_adaptive_window(false)
-            .timeout(Duration::from_secs(300))
+            // An idle-read timeout, not a total one: `timeout` also covers reading the
+            // body, so a blob that streams for longer than it is cut off and starts
+            // again from zero. A 1.2 GB layer at 2 MB/s needs about 10 minutes.
+            .read_timeout(Duration::from_secs(60))
             .connect_timeout(Duration::from_secs(30))
             .user_agent(concat!("quill/", env!("CARGO_PKG_VERSION")))
             .build()?;
